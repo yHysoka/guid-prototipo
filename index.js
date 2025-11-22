@@ -20,7 +20,7 @@ const isUuid = (v) =>
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
 
 // ======================================================
-// CRIAR CHECKOUT (PIX) SEM SDK — SOMENTE API REST
+// CREATE CHECKOUT (PIX) — REST API MP
 // ======================================================
 app.post("/create-checkout", async (req, res) => {
   try {
@@ -32,7 +32,6 @@ app.post("/create-checkout", async (req, res) => {
     if (String(plan).toLowerCase() !== "pro")
       return res.status(400).json({ error: "Plano inválido" });
 
-    // Requisição REST pro Mercado Pago
     const mpRes = await fetch(
       "https://api.mercadopago.com/checkout/preferences",
       {
@@ -76,7 +75,6 @@ app.post("/create-checkout", async (req, res) => {
 
     const json = await mpRes.json();
 
-    // salvar no Supabase
     const { data, error } = await supabase
       .from("subscriptions")
       .insert({
@@ -100,7 +98,7 @@ app.post("/create-checkout", async (req, res) => {
 });
 
 // ======================================================
-// WEBHOOK — usando REST sem SDK
+// WEBHOOK — MERCADO PAGO
 // ======================================================
 app.post("/webhook/mercadopago", async (req, res) => {
   try {
@@ -110,9 +108,7 @@ app.post("/webhook/mercadopago", async (req, res) => {
     const r = await fetch(
       `https://api.mercadopago.com/v1/payments/${paymentId}`,
       {
-        headers: {
-          Authorization: `Bearer ${process.env.MP_ACCESS_TOKEN}`,
-        },
+        headers: { Authorization: `Bearer ${process.env.MP_ACCESS_TOKEN}` },
       }
     );
 
@@ -151,6 +147,45 @@ app.post("/webhook/mercadopago", async (req, res) => {
   } catch (err) {
     console.error("Erro webhook:", err);
     return res.status(200).send("ok");
+  }
+});
+
+// ======================================================
+// CONSULTAR STATUS DA ASSINATURA (NOVO!)
+// ======================================================
+app.get("/subscription-status", async (req, res) => {
+  try {
+    // Aceita as duas formas: user_id e userId
+    const user_id = req.query.user_id || req.query.userId;
+
+    if (!user_id || !isUuid(user_id)) {
+      return res.status(400).json({ error: "user_id inválido" });
+    }
+
+    const { data, error } = await supabase
+      .from("subscriptions")
+      .select("status, plan, expires_at")
+      .eq("user_id", user_id)
+      .order("id", { ascending: false })
+      .limit(1)
+      .single();
+
+    if (!data) {
+      return res.json({
+        status: "free",
+        plan: "free",
+        expires_at: null,
+      });
+    }
+
+    return res.json({
+      status: data.status || "free",
+      plan: data.plan || "free",
+      expires_at: data.expires_at,
+    });
+  } catch (err) {
+    console.error("Erro em /subscription-status:", err);
+    return res.status(500).json({ error: "Erro interno" });
   }
 });
 
