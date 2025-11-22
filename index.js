@@ -185,6 +185,43 @@ app.get("/subscription-status", async (req, res) => {
 });
 
 // ======================================================
+// DELETE ACCOUNT — ADMIN API (Service Role Required)
+// ======================================================
+app.post("/delete-account", async (req, res) => {
+  try {
+    const { user_id } = req.body;
+
+    if (!user_id || !isUuid(user_id)) {
+      return res.status(400).json({ error: "user_id inválido" });
+    }
+
+    console.log("🟥 Excluindo conta do usuário:", user_id);
+
+    // Remove do Supabase Auth (usuário)
+    const { error: deleteAuthError } = await supabase.auth.admin.deleteUser(user_id);
+
+    if (deleteAuthError) {
+      console.error("Erro deleteUser:", deleteAuthError);
+      return res.status(400).json({ error: deleteAuthError.message });
+    }
+
+    // Remove histórico de assinaturas
+    await supabase
+      .from("user_subscriptions")
+      .delete()
+      .eq("user_id", user_id);
+
+    console.log("🟥 Conta excluída com sucesso:", user_id);
+
+    return res.json({ success: true });
+
+  } catch (err) {
+    console.error("❌ Erro em /delete-account:", err);
+    return res.status(500).json({ error: "Erro interno" });
+  }
+});
+
+// ======================================================
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () =>
   console.log("Guied Subscriptions REST rodando na porta", PORT)
