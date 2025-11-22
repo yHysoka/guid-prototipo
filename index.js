@@ -2,6 +2,7 @@ import express from "express";
 import cors from "cors";
 import pkg from "@supabase/supabase-js";
 import dotenv from "dotenv";
+import fetch from "node-fetch";
 
 dotenv.config();
 
@@ -20,21 +21,11 @@ const isUuid = (v) =>
     /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
 
 // ======================================================
-// CREATE CHECKOUT (PIX) — REST API MP
+// CHECKOUT SIMPLES — PARA LIBERAR A CONTA DO MP
 // ======================================================
 app.post("/create-checkout", async (req, res) => {
     try {
-
-        console.log("🔥 BODY RECEBIDO:", req.body);
-
-        const { user_id, plan } = req.body;
-
-        if (!isUuid(user_id))
-            return res.status(400).json({ error: "UUID inválido" });
-
-
-        if (String(plan).toLowerCase() !== "pro")
-            return res.status(400).json({ error: "Plano inválido" });
+        console.log("🔥 CHECKOUT SIMPLES DISPARADO");
 
         const mpRes = await fetch(
             "https://api.mercadopago.com/checkout/preferences",
@@ -47,64 +38,37 @@ app.post("/create-checkout", async (req, res) => {
                 body: JSON.stringify({
                     items: [
                         {
-                            title: "Assinatura Guied – PRO (Mensal)",
+                            title: "Teste de Liberação Guied",
                             quantity: 1,
-                            unit_price: 9.9,
-                            currency_id: "BRL",
+                            unit_price: 1.00,
                         },
                     ],
-                    payment_methods: {
-                        default_payment_method_id: "pix",
-                        excluded_payment_types: [
-                            { id: "credit_card" },
-                            { id: "debit_card" },
-                            { id: "ticket" },
-                        ],
-                    },
-                    back_urls: {
-                        success: "https://guied.app/success",
-                        failure: "https://guied.app/failure",
-                        pending: "https://guied.app/pending",
-                    },
-                    auto_return: "approved",
                     notification_url:
                         "https://guied-subscriptions-api.onrender.com/webhook/mercadopago",
-                    metadata: {
-                        user_id,
-                        plan: "pro",
-                    },
                 }),
             }
         );
 
         const json = await mpRes.json();
+        console.log("🔍 RESPOSTA SIMPLES:", json);
 
-        console.log("🔍 RESPOSTA MERCADO PAGO:", json);
-
-        const { data, error } = await supabase
-            .from("subscriptions")
-            .insert({
-                user_id,
-                plan: "pro",
-                status: "pending",
-                external_preference_id: json.id,
-            })
-            .select()
-            .single();
+        if (!json.init_point)
+            return res
+                .status(400)
+                .json({ error: "Falha ao criar checkout simples", mp: json });
 
         return res.json({
             init_point: json.init_point,
             preference_id: json.id,
-            subscription: data,
         });
     } catch (err) {
-        console.error("Erro checkout:", err);
+        console.error("Erro simples:", err);
         return res.status(500).json({ error: "Erro interno" });
     }
 });
 
 // ======================================================
-// WEBHOOK — MERCADO PAGO
+// WEBHOOK MERCADO PAGO
 // ======================================================
 app.post("/webhook/mercadopago", async (req, res) => {
     try {
@@ -114,39 +78,17 @@ app.post("/webhook/mercadopago", async (req, res) => {
         const r = await fetch(
             `https://api.mercadopago.com/v1/payments/${paymentId}`,
             {
-                headers: { Authorization: `Bearer ${process.env.MERCADO_PAGO_ACCESS_TOKEN}` },
+                headers: {
+                    Authorization: `Bearer ${process.env.MERCADO_PAGO_ACCESS_TOKEN}`,
+                },
             }
         );
 
         const info = await r.json();
+        console.log("🔎 WEBHOOK PAYMENT INFO:", info);
 
         if (info.status === "approved") {
-            const preferenceId =
-                info.order?.id ||
-                info.metadata?.preference_id ||
-                info.metadata?.external_preference_id;
-
-            const { data } = await supabase
-                .from("subscriptions")
-                .select("*")
-                .eq("external_preference_id", preferenceId)
-                .maybeSingle();
-
-            if (data) {
-                const start = new Date();
-                const exp = new Date();
-                exp.setDate(exp.getDate() + 30);
-
-                await supabase
-                    .from("subscriptions")
-                    .update({
-                        status: "active",
-                        started_at: start.toISOString(),
-                        expires_at: exp.toISOString(),
-                        external_payment_id: String(paymentId),
-                    })
-                    .eq("id", data.id);
-            }
+            return res.status(200).send("ok");
         }
 
         return res.status(200).send("ok");
@@ -157,18 +99,17 @@ app.post("/webhook/mercadopago", async (req, res) => {
 });
 
 // ======================================================
-// CONSULTAR STATUS DA ASSINATURA (NOVO!)
+// STATUS DA ASSINATURA
 // ======================================================
 app.get("/subscription-status", async (req, res) => {
     try {
-        // Aceita as duas formas: user_id e userId
         const user_id = req.query.user_id || req.query.userId;
 
         if (!user_id || !isUuid(user_id)) {
             return res.status(400).json({ error: "user_id inválido" });
         }
 
-        const { data, error } = await supabase
+        const { data } = await supabase
             .from("subscriptions")
             .select("status, plan, expires_at")
             .eq("user_id", user_id)
