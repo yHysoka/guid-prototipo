@@ -79,6 +79,8 @@ app.post("/create-checkout", async (req, res) => {
 
         const json = await mpRes.json();
 
+        console.log("🔍 RESPOSTA MERCADO PAGO:", json);
+
         const { data, error } = await supabase
             .from("subscriptions")
             .insert({
