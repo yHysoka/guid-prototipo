@@ -21,11 +21,18 @@ const isUuid = (v) =>
     /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
 
 // ======================================================
-// CHECKOUT SIMPLES — PARA LIBERAR A CONTA DO MP
+// CHECKOUT PRO REAL — PRODUÇÃO
 // ======================================================
 app.post("/create-checkout", async (req, res) => {
     try {
-        console.log("🔥 CHECKOUT SIMPLES DISPARADO");
+        const { user_id } = req.body;
+
+        if (!user_id || !isUuid(user_id))
+            return res.status(400).json({ error: "user_id inválido" });
+
+        console.log("🟦 Criando checkout PRO para:", user_id);
+
+        const price = 9.90;
 
         const mpRes = await fetch(
             "https://api.mercadopago.com/checkout/preferences",
@@ -38,37 +45,48 @@ app.post("/create-checkout", async (req, res) => {
                 body: JSON.stringify({
                     items: [
                         {
-                            title: "Teste de Liberação Guied",
+                            title: "Assinatura Guied PRO",
                             quantity: 1,
-                            unit_price: 1.00,
-                        },
+                            unit_price: price
+                        }
                     ],
+                    statement_descriptor: "GUIED PRO",
+                    external_reference: `${user_id}|pro`,
+                    back_urls: {
+                        success: "https://guied.app/sucesso",
+                        pending: "https://guied.app/pendente",
+                        failure: "https://guied.app/erro"
+                    },
+                    auto_return: "approved",
                     notification_url:
-                        "https://guied-subscriptions-api.onrender.com/webhook/mercadopago",
+                        "https://guied-subscriptions-api.onrender.com/webhook/mercadopago"
                 }),
             }
         );
 
         const json = await mpRes.json();
-        console.log("🔍 RESPOSTA SIMPLES:", json);
+        console.log("🟦 RESPOSTA CHECKOUT PRO:", json);
 
-        if (!json.init_point)
-            return res
-                .status(400)
-                .json({ error: "Falha ao criar checkout simples", mp: json });
+        if (!json.init_point) {
+            return res.status(400).json({
+                error: "Falha ao criar checkout PRO",
+                mp: json
+            });
+        }
 
         return res.json({
             init_point: json.init_point,
-            preference_id: json.id,
+            preference_id: json.id
         });
+
     } catch (err) {
-        console.error("Erro simples:", err);
+        console.error("❌ Erro create-checkout:", err);
         return res.status(500).json({ error: "Erro interno" });
     }
 });
 
 // ======================================================
-// WEBHOOK MERCADO PAGO
+// WEBHOOK MERCADO PAGO — PRODUÇÃO
 // ======================================================
 app.post("/webhook/mercadopago", async (req, res) => {
     try {
@@ -87,11 +105,29 @@ app.post("/webhook/mercadopago", async (req, res) => {
         const info = await r.json();
         console.log("🔎 WEBHOOK PAYMENT INFO:", info);
 
-        if (info.status === "approved") {
+        if (info.status !== "approved") 
+            return res.status(200).send("ok");
+
+        const [user_id, plan] = (info.external_reference || "").split("|");
+
+        if (!user_id || !isUuid(user_id)) {
+            console.log("🚫 user_id inválido no webhook");
             return res.status(200).send("ok");
         }
 
+        const expires = new Date();
+        expires.setDate(expires.getDate() + 30);
+
+        await supabase.from("subscriptions").insert({
+            user_id,
+            plan,
+            status: "active",
+            expires_at: expires.toISOString()
+        });
+
+        console.log("🔥 Assinatura ativada para", user_id);
         return res.status(200).send("ok");
+
     } catch (err) {
         console.error("Erro webhook:", err);
         return res.status(200).send("ok");
@@ -99,7 +135,7 @@ app.post("/webhook/mercadopago", async (req, res) => {
 });
 
 // ======================================================
-// STATUS DA ASSINATURA
+// STATUS DA ASSINATURA — PRODUÇÃO
 // ======================================================
 app.get("/subscription-status", async (req, res) => {
     try {
@@ -130,6 +166,7 @@ app.get("/subscription-status", async (req, res) => {
             plan: data.plan || "free",
             expires_at: data.expires_at,
         });
+
     } catch (err) {
         console.error("Erro em /subscription-status:", err);
         return res.status(500).json({ error: "Erro interno" });
