@@ -41,7 +41,7 @@ app.post("/create-checkout", async (req, res) => {
             {
                 method: "POST",
                 headers: {
-                    "Authorization": `Bearer ${process.env.MP_ACCESS_TOKEN}`,
+                    "Authorization": `Bearer ${process.env.MERCADO_PAGO_ACCESS_TOKEN}`,
                     "Content-Type": "application/json",
                 },
                 body: JSON.stringify({
@@ -114,7 +114,7 @@ app.post("/webhook/mercadopago", async (req, res) => {
         const r = await fetch(
             `https://api.mercadopago.com/v1/payments/${paymentId}`,
             {
-                headers: { Authorization: `Bearer ${process.env.MP_ACCESS_TOKEN}` },
+                headers: { Authorization: `Bearer ${process.env.MERCADO_PAGO_ACCESS_TOKEN}` },
             }
         );
 
