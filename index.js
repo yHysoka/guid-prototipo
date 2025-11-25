@@ -154,19 +154,19 @@ app.post("/webhook/mercadopago", async (req, res) => {
 
     // Cria registro de assinatura ativa
     const { error: insertError } = await supabase
-      .from("user_subscriptions")
+      .from("subscriptions")
       .insert({
         user_id,
         plan,
         status: "active",
         started_at: now.toISOString(),
         expires_at: expires.toISOString(),
-        current_period_end: expires.toISOString(),
         mp_preference_id: info?.order?.id || null,
-        external_payment_id: info.id,
-        external_preference_id: info.external_reference,
+        payment_id: info.id,
+        preference_id: info.external_reference,
         renews: false,
       });
+
 
     if (insertError) {
       console.error("❌ Erro ao inserir assinatura:", insertError);
@@ -193,7 +193,8 @@ app.get("/subscription-status", async (req, res) => {
     }
 
     const { data, error } = await supabase
-      .from("user_subscriptions")
+      .from("subscriptions")
+
       .select("status, plan, expires_at")
       .eq("user_id", user_id)
       .order("created_at", { ascending: false })
@@ -250,7 +251,8 @@ app.post("/cancel-subscription", async (req, res) => {
     console.log("🟥 Cancelando assinatura do usuário:", user_id);
 
     const { error } = await supabase
-      .from("user_subscriptions")
+      .from("subscriptions")
+
       .update({
         status: "canceled",
         renews: false,
@@ -292,7 +294,8 @@ app.post("/delete-account", async (req, res) => {
       return res.status(400).json({ error: deleteAuthError.message });
     }
 
-    await supabase.from("user_subscriptions").delete().eq("user_id", user_id);
+    await supabase.from("subscriptions").delete().eq("user_id", user_id);
+
 
     console.log("🟥 Conta excluída com sucesso:", user_id);
 
