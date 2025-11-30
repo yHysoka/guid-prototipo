@@ -46,7 +46,7 @@ app.post("/create-checkout", async (req, res) => {
       if (p === "pro") normalizedPlan = "pro";
     }
 
-    const price = 9.9;
+    const price = 1.0;
 
     const mpRes = await fetch(
       "https://api.mercadopago.com/checkout/preferences",
@@ -109,13 +109,30 @@ app.post("/webhook/mercadopago", async (req, res) => {
   console.log("📩 BODY:", req.body);
 
   try {
-    const paymentId = req.body?.data?.id;
+    // 1) Verifica se é webhook direto de pagamento (melhor caso)
+    let paymentId = req.body?.data?.id;
+
+    // 2) Se for merchant_order → buscar pagamentos dentro da ordem
+    if (!paymentId && req.body?.resource?.includes("merchant_orders")) {
+      const orderUrl = req.body.resource;
+
+      const orderRes = await fetch(orderUrl, {
+        headers: { Authorization: `Bearer ${process.env.MERCADO_PAGO_ACCESS_TOKEN}` },
+      });
+
+      const orderJson = await orderRes.json();
+
+      if (orderJson?.payments?.length > 0) {
+        paymentId = orderJson.payments[0].id;
+      }
+    }
 
     if (!paymentId) {
       console.log("⚠️ Webhook sem paymentId → ignorado");
       return res.status(200).send("ok");
     }
 
+    // 3) Buscar pagamento real no Mercado Pago
     const r = await fetch(
       `https://api.mercadopago.com/v1/payments/${paymentId}`,
       {
@@ -126,7 +143,6 @@ app.post("/webhook/mercadopago", async (req, res) => {
     );
 
     const info = await r.json();
-
     console.log("🔎 PAYMENT FULL INFO:", info);
 
     if (info.status !== "approved") {
@@ -134,9 +150,12 @@ app.post("/webhook/mercadopago", async (req, res) => {
       return res.status(200).send("ok");
     }
 
+    // 4) Extrair user_id e plano
     let user_id =
       info?.metadata?.user_id || info?.external_reference?.split("|")[0];
-    let plan = info?.metadata?.plan || info?.external_reference?.split("|")[1];
+
+    let plan =
+      info?.metadata?.plan || info?.external_reference?.split("|")[1];
 
     if (!user_id || !isUuid(user_id)) {
       console.log("❌ user_id inválido:", user_id);
@@ -145,21 +164,46 @@ app.post("/webhook/mercadopago", async (req, res) => {
 
     if (!plan) plan = "pro";
 
+    // 5) Criar datas
     const now = new Date();
     const expires = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
 
-    await supabase.from("subscriptions").insert({
-      user_id,
-      plan,
-      status: "active",
-      started_at: now.toISOString(),
-      expires_at: expires.toISOString(),
-      payment_id: info.id,
-      preference_id: info.external_reference,
-      renews: false,
-    });
+    // 6) Verificar se já existe assinatura
+    const { data: existing } = await supabase
+      .from("user_subscriptions")
+      .select("*")
+      .eq("user_id", user_id)
+      .maybeSingle();
 
-    console.log("🔥 Assinatura ativada para", user_id, "plano:", plan);
+    if (existing) {
+      // Atualizar assinatura existente
+      await supabase
+        .from("user_subscriptions")
+        .update({
+          plan,
+          status: "active",
+          current_period_end: expires.toISOString(),
+          expires_at: expires.toISOString(),
+          mp_preference_id: info.external_reference,
+          renews: false,
+        })
+        .eq("id", existing.id);
+
+      console.log("🔥 Assinatura atualizada para", user_id);
+    } else {
+      // Criar nova assinatura
+      await supabase.from("user_subscriptions").insert({
+        user_id,
+        plan,
+        status: "active",
+        current_period_end: expires.toISOString(),
+        expires_at: expires.toISOString(),
+        mp_preference_id: info.external_reference,
+        renews: false,
+      });
+
+      console.log("🔥 Nova assinatura criada para", user_id);
+    }
 
     return res.status(200).send("ok");
   } catch (err) {
@@ -167,6 +211,7 @@ app.post("/webhook/mercadopago", async (req, res) => {
     return res.status(200).send("ok");
   }
 });
+
 
 // ======================================================
 // STATUS ASSINATURA
