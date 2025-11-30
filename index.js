@@ -9,25 +9,25 @@ dotenv.config();
 const { createClient } = pkg;
 
 // ======================================================
-// SUPABASE
+// SUPABASE CLIENTE COM SERVICE ROLE
 // ======================================================
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-// ======================================================
-// APP
-// ======================================================
 const app = express();
 app.use(cors());
 app.use(express.json());
 
+// ======================================================
+// VALIDADOR
+// ======================================================
 const isUuid = (v) =>
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
 
 // ======================================================
-// CREATE CHECKOUT — PIX
+// MERCADO PAGO — CHECKOUT PIX
 // ======================================================
 app.post("/create-checkout", async (req, res) => {
   try {
@@ -39,14 +39,10 @@ app.post("/create-checkout", async (req, res) => {
       return res.status(400).json({ error: "user_id inválido" });
     }
 
-    let normalizedPlan = "pro";
-    if (typeof plan === "string") {
-      const p = plan.toLowerCase();
-      if (p === "pro_plus") normalizedPlan = "pro_plus";
-      if (p === "pro") normalizedPlan = "pro";
-    }
+    const normalizedPlan =
+      plan?.toLowerCase() === "pro_plus" ? "pro_plus" : "pro";
 
-    const price = 1.0;
+    const price = normalizedPlan === "pro_plus" ? 19.9 : 9.9;
 
     const mpRes = await fetch(
       "https://api.mercadopago.com/checkout/preferences",
@@ -67,15 +63,22 @@ app.post("/create-checkout", async (req, res) => {
               unit_price: price,
             },
           ],
+
           external_reference: `${user_id}|${normalizedPlan}`,
-          notification_url:
-            "https://guied-subscriptions-api.onrender.com/webhook/mercadopago",
-          auto_return: "approved",
+
+          // RECOMENDAÇÕES OFICIAIS DO MERCADO PAGO
           back_urls: {
             success: "https://guied.app/sucesso",
             pending: "https://guied.app/pendente",
             failure: "https://guied.app/erro",
           },
+          auto_return: "approved",
+
+          statement_descriptor: "GUIED.APP",
+
+          notification_url:
+            "https://guied-subscriptions-api.onrender.com/webhook/mercadopago",
+
           metadata: {
             user_id,
             plan: normalizedPlan,
@@ -85,10 +88,14 @@ app.post("/create-checkout", async (req, res) => {
     );
 
     const json = await mpRes.json();
-    console.log("📦 CRIAR CHECKOUT MP:", json);
+
+    console.log("📦 Mercado Pago create:", json);
 
     if (!json.init_point) {
-      return res.status(400).json({ error: "Falha ao criar checkout PIX", json });
+      return res.status(400).json({
+        error: "Falha ao criar checkout PIX",
+        details: json,
+      });
     }
 
     return res.json({
@@ -102,22 +109,21 @@ app.post("/create-checkout", async (req, res) => {
 });
 
 // ======================================================
-// WEBHOOK MERCADO PAGO
+// WEBHOOK MERCADO PAGO (VERSÃO COMPLETA)
 // ======================================================
 app.post("/webhook/mercadopago", async (req, res) => {
-  console.log("🟪 WEBHOOK RECEBIDO");
+  console.log("\n🟪 WEBHOOK RECEBIDO");
   console.log("📩 BODY:", req.body);
 
   try {
-    // 1) Verifica se é webhook direto de pagamento (melhor caso)
     let paymentId = req.body?.data?.id;
 
-    // 2) Se for merchant_order → buscar pagamentos dentro da ordem
+    // Suporte para merchant_orders (recomendação MP)
     if (!paymentId && req.body?.resource?.includes("merchant_orders")) {
-      const orderUrl = req.body.resource;
-
-      const orderRes = await fetch(orderUrl, {
-        headers: { Authorization: `Bearer ${process.env.MERCADO_PAGO_ACCESS_TOKEN}` },
+      const orderRes = await fetch(req.body.resource, {
+        headers: {
+          Authorization: `Bearer ${process.env.MERCADO_PAGO_ACCESS_TOKEN}`,
+        },
       });
 
       const orderJson = await orderRes.json();
@@ -132,7 +138,7 @@ app.post("/webhook/mercadopago", async (req, res) => {
       return res.status(200).send("ok");
     }
 
-    // 3) Buscar pagamento real no Mercado Pago
+    // Buscar pagamento no Mercado Pago (recomendado)
     const r = await fetch(
       `https://api.mercadopago.com/v1/payments/${paymentId}`,
       {
@@ -143,14 +149,14 @@ app.post("/webhook/mercadopago", async (req, res) => {
     );
 
     const info = await r.json();
-    console.log("🔎 PAYMENT FULL INFO:", info);
+
+    console.log("🔎 PAYMENT INFO COMPLETA:", info);
 
     if (info.status !== "approved") {
-      console.log("⏳ Pagamento não aprovado → ignorado");
+      console.log("⏳ Pagamento ainda não aprovado → ignorado");
       return res.status(200).send("ok");
     }
 
-    // 4) Extrair user_id e plano
     let user_id =
       info?.metadata?.user_id || info?.external_reference?.split("|")[0];
 
@@ -164,11 +170,10 @@ app.post("/webhook/mercadopago", async (req, res) => {
 
     if (!plan) plan = "pro";
 
-    // 5) Criar datas
     const now = new Date();
-    const expires = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+    const expires = new Date(now.getTime() + 30 * 86400000);
 
-    // 6) Verificar se já existe assinatura
+    // Verifica assinatura existente
     const { data: existing } = await supabase
       .from("user_subscriptions")
       .select("*")
@@ -176,7 +181,6 @@ app.post("/webhook/mercadopago", async (req, res) => {
       .maybeSingle();
 
     if (existing) {
-      // Atualizar assinatura existente
       await supabase
         .from("user_subscriptions")
         .update({
@@ -191,7 +195,6 @@ app.post("/webhook/mercadopago", async (req, res) => {
 
       console.log("🔥 Assinatura atualizada para", user_id);
     } else {
-      // Criar nova assinatura
       await supabase.from("user_subscriptions").insert({
         user_id,
         plan,
@@ -212,9 +215,8 @@ app.post("/webhook/mercadopago", async (req, res) => {
   }
 });
 
-
 // ======================================================
-// STATUS ASSINATURA
+// STATUS ASSINATURA (100% CORRIGIDO)
 // ======================================================
 app.get("/subscription-status", async (req, res) => {
   try {
@@ -227,7 +229,7 @@ app.get("/subscription-status", async (req, res) => {
     }
 
     const { data } = await supabase
-      .from("subscriptions")
+      .from("user_subscriptions")
       .select("status, plan, expires_at")
       .eq("user_id", user_id)
       .order("created_at", { ascending: false })
@@ -240,8 +242,7 @@ app.get("/subscription-status", async (req, res) => {
 
     const now = new Date();
     const exp = data.expires_at ? new Date(data.expires_at) : null;
-
-    const isActive = data.status === "active" && exp && exp > now;
+    const isActive = data.status === "active" && exp > now;
 
     return res.json({
       status: isActive ? "active" : "free",
@@ -266,7 +267,7 @@ app.post("/cancel-subscription", async (req, res) => {
     }
 
     await supabase
-      .from("subscriptions")
+      .from("user_subscriptions")
       .update({ status: "canceled", renews: false })
       .eq("user_id", user_id)
       .eq("status", "active");
@@ -279,5 +280,9 @@ app.post("/cancel-subscription", async (req, res) => {
 });
 
 // ======================================================
+// START SERVER
+// ======================================================
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log("🔥 Guied Subscriptions API rodando na porta", PORT));
+app.listen(PORT, () =>
+  console.log(`🔥 Guied Subscriptions API rodando na porta ${PORT}`)
+);
