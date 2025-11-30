@@ -21,7 +21,21 @@ const supabase = createClient(
 // ======================================================
 const app = express();
 app.use(cors());
-app.use(express.json());
+
+// ======================================================
+// MIDDLEWARE — Mercado Pago precisa do RAW BODY
+// ======================================================
+app.use((req, res, next) => {
+  const isMPWebhook =
+    req.originalUrl === "/webhook/mercadopago" &&
+    req.headers["x-signature"];
+
+  if (isMPWebhook) {
+    express.raw({ type: "application/json" })(req, res, next);
+  } else {
+    express.json()(req, res, next);
+  }
+});
 
 const isUuid = (v) =>
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
@@ -37,7 +51,6 @@ app.post("/create-checkout", async (req, res) => {
       return res.status(400).json({ error: "user_id inválido" });
     }
 
-    // Plano vindo do app: "pro" ou "pro_plus"
     let normalizedPlan = "pro";
     if (typeof plan === "string") {
       const p = plan.toLowerCase();
@@ -47,7 +60,7 @@ app.post("/create-checkout", async (req, res) => {
 
     console.log("🟦 Criando checkout para:", user_id, "Plano:", normalizedPlan);
 
-    const price = 9.9; // por enquanto fixo p/ PRO
+    const price = normalizedPlan === "pro_plus" ? 19.9 : 1.0;
 
     const mpRes = await fetch(
       "https://api.mercadopago.com/checkout/preferences",
@@ -68,12 +81,12 @@ app.post("/create-checkout", async (req, res) => {
               unit_price: price,
             },
           ],
-          statement_descriptor: "GUIED",
           external_reference: `${user_id}|${normalizedPlan}`,
           metadata: {
             user_id,
             plan: normalizedPlan,
           },
+          statement_descriptor: "GUIED",
           back_urls: {
             success: "https://guied.app/sucesso",
             pending: "https://guied.app/pendente",
@@ -111,9 +124,22 @@ app.post("/create-checkout", async (req, res) => {
 // ======================================================
 app.post("/webhook/mercadopago", async (req, res) => {
   try {
-    const paymentId = req.body?.data?.id;
+    console.log("🟪 WEBHOOK RECEBIDO");
+
+    // Mercado Pago envia RAW BODY → req.body é um buffer
+    let jsonBody = {};
+
+    try {
+      jsonBody = JSON.parse(req.body.toString());
+    } catch (e) {
+      console.log("🚫 Corpo inválido");
+      return res.status(200).send("ok");
+    }
+
+    const paymentId = jsonBody?.data?.id;
     if (!paymentId) return res.status(200).send("ok");
 
+    // Buscar pagamento real
     const r = await fetch(
       `https://api.mercadopago.com/v1/payments/${paymentId}`,
       {
@@ -126,11 +152,13 @@ app.post("/webhook/mercadopago", async (req, res) => {
     const info = await r.json();
     console.log("🔎 WEBHOOK PAYMENT INFO:", info);
 
+    // Se não aprovado → ignorar
     if (info.status !== "approved") {
+      console.log("📌 Pagamento ainda não aprovado");
       return res.status(200).send("ok");
     }
 
-    // user_id + plano vindos do metadata ou external_reference
+    // user_id + plano
     let user_id = info?.metadata?.user_id;
     let plan = info?.metadata?.plan;
 
@@ -145,14 +173,24 @@ app.post("/webhook/mercadopago", async (req, res) => {
       return res.status(200).send("ok");
     }
 
-    if (!plan) {
-      plan = "pro";
-    }
+    if (!plan) plan = "pro";
 
     const now = new Date();
     const expires = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
 
-    // Cria registro de assinatura ativa
+    // Evitar duplicação
+    const { data: exists } = await supabase
+      .from("subscriptions")
+      .select("*")
+      .eq("payment_id", info.id)
+      .maybeSingle();
+
+    if (exists) {
+      console.log("⚠️ Pagamento já processado.");
+      return res.status(200).send("ok");
+    }
+
+    // Inserir assinatura
     const { error: insertError } = await supabase
       .from("subscriptions")
       .insert({
@@ -167,7 +205,6 @@ app.post("/webhook/mercadopago", async (req, res) => {
         renews: false,
       });
 
-
     if (insertError) {
       console.error("❌ Erro ao inserir assinatura:", insertError);
     } else {
@@ -176,7 +213,7 @@ app.post("/webhook/mercadopago", async (req, res) => {
 
     return res.status(200).send("ok");
   } catch (err) {
-    console.error("Erro webhook:", err);
+    console.error("❌ Erro webhook:", err);
     return res.status(200).send("ok");
   }
 });
@@ -194,16 +231,11 @@ app.get("/subscription-status", async (req, res) => {
 
     const { data, error } = await supabase
       .from("subscriptions")
-
       .select("status, plan, expires_at")
       .eq("user_id", user_id)
       .order("created_at", { ascending: false })
       .limit(1)
       .maybeSingle();
-
-    if (error) {
-      console.error("Erro Supabase /subscription-status:", error);
-    }
 
     if (!data) {
       return res.json({
@@ -233,75 +265,6 @@ app.get("/subscription-status", async (req, res) => {
     });
   } catch (err) {
     console.error("Erro em /subscription-status:", err);
-    return res.status(500).json({ error: "Erro interno" });
-  }
-});
-
-// ======================================================
-// CANCELAR ASSINATURA
-// ======================================================
-app.post("/cancel-subscription", async (req, res) => {
-  try {
-    const { user_id } = req.body;
-
-    if (!user_id || !isUuid(user_id)) {
-      return res.status(400).json({ error: "user_id inválido" });
-    }
-
-    console.log("🟥 Cancelando assinatura do usuário:", user_id);
-
-    const { error } = await supabase
-      .from("subscriptions")
-
-      .update({
-        status: "canceled",
-        renews: false,
-      })
-      .eq("user_id", user_id)
-      .eq("status", "active");
-
-    if (error) {
-      console.error("Erro ao cancelar assinatura:", error);
-      return res.status(400).json({ error: error.message });
-    }
-
-    return res.json({ success: true });
-  } catch (err) {
-    console.error("❌ Erro em /cancel-subscription:", err);
-    return res.status(500).json({ error: "Erro interno" });
-  }
-});
-
-// ======================================================
-// DELETE ACCOUNT — ADMIN API (Service Role Required)
-// ======================================================
-app.post("/delete-account", async (req, res) => {
-  try {
-    const { user_id } = req.body;
-
-    if (!user_id || !isUuid(user_id)) {
-      return res.status(400).json({ error: "user_id inválido" });
-    }
-
-    console.log("🟥 Excluindo conta do usuário:", user_id);
-
-    const { error: deleteAuthError } = await supabase.auth.admin.deleteUser(
-      user_id
-    );
-
-    if (deleteAuthError) {
-      console.error("Erro deleteUser:", deleteAuthError);
-      return res.status(400).json({ error: deleteAuthError.message });
-    }
-
-    await supabase.from("subscriptions").delete().eq("user_id", user_id);
-
-
-    console.log("🟥 Conta excluída com sucesso:", user_id);
-
-    return res.json({ success: true });
-  } catch (err) {
-    console.error("❌ Erro em /delete-account:", err);
     return res.status(500).json({ error: "Erro interno" });
   }
 });
