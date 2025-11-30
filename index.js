@@ -22,20 +22,9 @@ const supabase = createClient(
 const app = express();
 app.use(cors());
 
-// ======================================================
-// MIDDLEWARE — Mercado Pago precisa do RAW BODY
-// ======================================================
-app.use((req, res, next) => {
-  const isMPWebhook =
-    req.originalUrl === "/webhook/mercadopago" &&
-    req.headers["x-signature"];
-
-  if (isMPWebhook) {
-    express.raw({ type: "application/json" })(req, res, next);
-  } else {
-    express.json()(req, res, next);
-  }
-});
+// PRECISA vir antes do express.json
+app.use(express.text({ type: "*/*" }));
+app.use(express.json({ strict: false }));
 
 const isUuid = (v) =>
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
@@ -52,15 +41,11 @@ app.post("/create-checkout", async (req, res) => {
     }
 
     let normalizedPlan = "pro";
-    if (typeof plan === "string") {
-      const p = plan.toLowerCase();
-      if (p === "pro_plus") normalizedPlan = "pro_plus";
-      if (p === "pro") normalizedPlan = "pro";
-    }
+    if (plan && plan.toLowerCase() === "pro_plus") normalizedPlan = "pro_plus";
 
     console.log("🟦 Criando checkout para:", user_id, "Plano:", normalizedPlan);
 
-    const price = normalizedPlan === "pro_plus" ? 19.9 : 1.0;
+    const price = 9.9;
 
     const mpRes = await fetch(
       "https://api.mercadopago.com/checkout/preferences",
@@ -81,12 +66,9 @@ app.post("/create-checkout", async (req, res) => {
               unit_price: price,
             },
           ],
-          external_reference: `${user_id}|${normalizedPlan}`,
-          metadata: {
-            user_id,
-            plan: normalizedPlan,
-          },
           statement_descriptor: "GUIED",
+          external_reference: `${user_id}|${normalizedPlan}`,
+          metadata: { user_id, plan: normalizedPlan },
           back_urls: {
             success: "https://guied.app/sucesso",
             pending: "https://guied.app/pendente",
@@ -103,10 +85,7 @@ app.post("/create-checkout", async (req, res) => {
     console.log("🟦 RESPOSTA CHECKOUT:", json);
 
     if (!json.init_point) {
-      return res.status(400).json({
-        error: "Falha ao criar checkout",
-        mp: json,
-      });
+      return res.status(400).json({ error: "Falha ao criar checkout", mp: json });
     }
 
     return res.json({
@@ -120,26 +99,40 @@ app.post("/create-checkout", async (req, res) => {
 });
 
 // ======================================================
-// WEBHOOK MERCADO PAGO — PRODUÇÃO
+// WEBHOOK MERCADO PAGO — SUPORTA QUALQUER FORMATO
 // ======================================================
 app.post("/webhook/mercadopago", async (req, res) => {
   try {
     console.log("🟪 WEBHOOK RECEBIDO");
 
-    // Mercado Pago envia RAW BODY → req.body é um buffer
-    let jsonBody = {};
+    let body = req.body;
 
-    try {
-      jsonBody = JSON.parse(req.body.toString());
-    } catch (e) {
-      console.log("🚫 Corpo inválido");
+    // Caso o Mercado Pago envie como texto puro
+    if (typeof body === "string") {
+      try {
+        body = JSON.parse(body);
+      } catch (e) {
+        console.log("📩 BODY RAW STRING:", body);
+      }
+    }
+
+    console.log("📩 BODY PARSED:", body);
+
+    let paymentId = null;
+
+    // Suporta todos os formatos do MP
+    if (body?.data?.id) paymentId = body.data.id;
+    if (!paymentId && body["data.id"]) paymentId = body["data.id"];
+    if (!paymentId && body.id) paymentId = body.id;
+    if (!paymentId && body.resource) paymentId = body.resource;
+
+    if (!paymentId) {
+      console.log("🚫 BODY NÃO TEM ID → ignorando");
       return res.status(200).send("ok");
     }
 
-    const paymentId = jsonBody?.data?.id;
-    if (!paymentId) return res.status(200).send("ok");
+    console.log("🔎 PaymentId extraído:", paymentId);
 
-    // Buscar pagamento real
     const r = await fetch(
       `https://api.mercadopago.com/v1/payments/${paymentId}`,
       {
@@ -150,22 +143,20 @@ app.post("/webhook/mercadopago", async (req, res) => {
     );
 
     const info = await r.json();
-    console.log("🔎 WEBHOOK PAYMENT INFO:", info);
+    console.log("🔎 PAYMENT FULL INFO:", info);
 
-    // Se não aprovado → ignorar
     if (info.status !== "approved") {
-      console.log("📌 Pagamento ainda não aprovado");
+      console.log("⏳ Pagamento pendente → ignorando");
       return res.status(200).send("ok");
     }
 
-    // user_id + plano
     let user_id = info?.metadata?.user_id;
     let plan = info?.metadata?.plan;
 
     if (!user_id || !plan) {
       const [u, p] = (info.external_reference || "").split("|");
-      user_id = user_id || u;
-      plan = plan || p;
+      if (!user_id) user_id = u;
+      if (!plan) plan = p;
     }
 
     if (!user_id || !isUuid(user_id)) {
@@ -173,42 +164,23 @@ app.post("/webhook/mercadopago", async (req, res) => {
       return res.status(200).send("ok");
     }
 
-    if (!plan) plan = "pro";
-
     const now = new Date();
     const expires = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
 
-    // Evitar duplicação
-    const { data: exists } = await supabase
-      .from("subscriptions")
-      .select("*")
-      .eq("payment_id", info.id)
-      .maybeSingle();
-
-    if (exists) {
-      console.log("⚠️ Pagamento já processado.");
-      return res.status(200).send("ok");
-    }
-
-    // Inserir assinatura
-    const { error: insertError } = await supabase
-      .from("subscriptions")
-      .insert({
-        user_id,
-        plan,
-        status: "active",
-        started_at: now.toISOString(),
-        expires_at: expires.toISOString(),
-        mp_preference_id: info?.order?.id || null,
-        payment_id: info.id,
-        preference_id: info.external_reference,
-        renews: false,
-      });
+    const { error: insertError } = await supabase.from("subscriptions").insert({
+      user_id,
+      plan,
+      status: "active",
+      started_at: now.toISOString(),
+      expires_at: expires.toISOString(),
+      payment_id: info.id,
+      preference_id: info.external_reference,
+    });
 
     if (insertError) {
       console.error("❌ Erro ao inserir assinatura:", insertError);
     } else {
-      console.log("🔥 Assinatura ativada para", user_id, "plano:", plan);
+      console.log("🔥 ASSINATURA ATIVADA:", user_id, plan);
     }
 
     return res.status(200).send("ok");
@@ -229,7 +201,7 @@ app.get("/subscription-status", async (req, res) => {
       return res.status(400).json({ error: "user_id inválido" });
     }
 
-    const { data, error } = await supabase
+    const { data } = await supabase
       .from("subscriptions")
       .select("status, plan, expires_at")
       .eq("user_id", user_id)
@@ -238,31 +210,20 @@ app.get("/subscription-status", async (req, res) => {
       .maybeSingle();
 
     if (!data) {
-      return res.json({
-        status: "free",
-        plan: "free",
-        expires_at: null,
-      });
+      return res.json({ status: "free", plan: "free", expires_at: null });
     }
 
     const now = new Date();
     const exp = data.expires_at ? new Date(data.expires_at) : null;
-    const notExpired = exp && exp > now;
-    const isActive = data.status === "active";
 
-    if (!isActive || !notExpired) {
-      return res.json({
-        status: "free",
-        plan: "free",
-        expires_at: data.expires_at,
-      });
-    }
+    const active =
+      data.status === "active" && exp && exp > now;
 
-    return res.json({
-      status: data.status,
-      plan: data.plan || "free",
-      expires_at: data.expires_at,
-    });
+    return res.json(
+      active
+        ? { status: data.status, plan: data.plan, expires_at: data.expires_at }
+        : { status: "free", plan: "free", expires_at: data.expires_at }
+    );
   } catch (err) {
     console.error("Erro em /subscription-status:", err);
     return res.status(500).json({ error: "Erro interno" });
