@@ -39,6 +39,69 @@ function normalizePlan(plan) {
   return "pro";
 }
 
+function roundMoney(value) {
+  return Number(Number(value).toFixed(2));
+}
+
+// ======================================================
+// BENEFÍCIO DE INDICAÇÃO
+// ======================================================
+async function getActiveReferralBenefit(userId) {
+  const nowIso = new Date().toISOString();
+
+  const { data, error } = await supabase
+    .from("referral_benefits")
+    .select("*")
+    .eq("user_id", userId)
+    .eq("status", "active")
+    .gt("expires_at", nowIso)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error) {
+    console.error("Erro ao buscar referral_benefits:", error);
+    return null;
+  }
+
+  return data ?? null;
+}
+
+async function markReferralBenefitAsUsed(userId) {
+  const nowIso = new Date().toISOString();
+
+  const { data: activeBenefit, error: fetchError } = await supabase
+    .from("referral_benefits")
+    .select("id")
+    .eq("user_id", userId)
+    .eq("status", "active")
+    .gt("expires_at", nowIso)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (fetchError) {
+    console.error("Erro ao localizar benefício ativo:", fetchError);
+    return;
+  }
+
+  if (!activeBenefit) return;
+
+  const { error: updateError } = await supabase
+    .from("referral_benefits")
+    .update({
+      status: "used",
+      used_at: new Date().toISOString(),
+    })
+    .eq("id", activeBenefit.id);
+
+  if (updateError) {
+    console.error("Erro ao marcar benefício como usado:", updateError);
+  } else {
+    console.log("✅ Benefício de indicação marcado como usado:", activeBenefit.id);
+  }
+}
+
 // ======================================================
 // MERCADO PAGO — CHECKOUT PIX
 // ======================================================
@@ -53,7 +116,22 @@ app.post("/create-checkout", async (req, res) => {
     }
 
     const normalizedPlan = normalizePlan(plan);
-    const price = normalizedPlan === "pro+" ? 34.99 : 11.99;
+    const basePrice = normalizedPlan === "pro+" ? 34.99 : 11.99;
+
+    let finalPrice = basePrice;
+    let appliedDiscountPercent = 0;
+
+    const activeBenefit = await getActiveReferralBenefit(user_id);
+
+    if (activeBenefit && Number(activeBenefit.discount_percent) > 0) {
+      appliedDiscountPercent = Number(activeBenefit.discount_percent);
+      finalPrice = roundMoney(basePrice * (1 - appliedDiscountPercent / 100));
+    }
+
+    console.log("💰 Plano:", normalizedPlan);
+    console.log("💰 Preço base:", basePrice);
+    console.log("💰 Desconto:", appliedDiscountPercent);
+    console.log("💰 Preço final:", finalPrice);
 
     const mpRes = await fetch(
       "https://api.mercadopago.com/checkout/preferences",
@@ -68,15 +146,19 @@ app.post("/create-checkout", async (req, res) => {
             {
               title:
                 normalizedPlan === "pro+"
-                  ? "Assinatura Guied PRO+"
-                  : "Assinatura Guied PRO",
+                  ? appliedDiscountPercent > 0
+                    ? `Assinatura Guied PRO+ (${appliedDiscountPercent}% OFF)`
+                    : "Assinatura Guied PRO+"
+                  : appliedDiscountPercent > 0
+                    ? `Assinatura Guied PRO (${appliedDiscountPercent}% OFF)`
+                    : "Assinatura Guied PRO",
               quantity: 1,
               currency_id: "BRL",
-              unit_price: price,
+              unit_price: finalPrice,
             },
           ],
 
-          external_reference: `${user_id}|${normalizedPlan}`,
+          external_reference: `${user_id}|${normalizedPlan}|${appliedDiscountPercent}`,
 
           back_urls: {
             success: "https://guied.app/sucesso",
@@ -84,15 +166,16 @@ app.post("/create-checkout", async (req, res) => {
             failure: "https://guied.app/erro",
           },
           auto_return: "approved",
-
           statement_descriptor: "GUIED.APP",
-
           notification_url:
             "https://guied-subscriptions-api.onrender.com/webhook/mercadopago",
 
           metadata: {
             user_id,
             plan: normalizedPlan,
+            discount_percent: appliedDiscountPercent,
+            original_price: basePrice,
+            final_price: finalPrice,
           },
         }),
       }
@@ -101,7 +184,6 @@ app.post("/create-checkout", async (req, res) => {
     const json = await mpRes.json();
 
     console.log("📦 Mercado Pago create:", json);
-    console.log("💰 Plano:", normalizedPlan, "| Valor:", price);
 
     if (!json.init_point) {
       return res.status(400).json({
@@ -114,7 +196,9 @@ app.post("/create-checkout", async (req, res) => {
       init_point: json.init_point,
       preference_id: json.id,
       plan: normalizedPlan,
-      price,
+      original_price: basePrice,
+      final_price: finalPrice,
+      discount_percent: appliedDiscountPercent,
     });
   } catch (err) {
     console.error("❌ Erro create-checkout:", err);
@@ -175,6 +259,12 @@ app.post("/webhook/mercadopago", async (req, res) => {
     let plan =
       info?.metadata?.plan || info?.external_reference?.split("|")[1];
 
+    const discountPercent = Number(
+      info?.metadata?.discount_percent ||
+        info?.external_reference?.split("|")[2] ||
+        0
+    );
+
     if (!user_id || !isUuid(user_id)) {
       console.log("❌ user_id inválido:", user_id);
       return res.status(200).send("ok");
@@ -217,6 +307,10 @@ app.post("/webhook/mercadopago", async (req, res) => {
       });
 
       console.log("🔥 Nova assinatura criada para", user_id, "| plano:", plan);
+    }
+
+    if (discountPercent > 0) {
+      await markReferralBenefitAsUsed(user_id);
     }
 
     return res.status(200).send("ok");
